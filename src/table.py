@@ -87,6 +87,62 @@ from pymupdf import mupdf
 # Start of PyMuPDF interface code
 # -------------------------------------------------------------------
 
+# TODO: BUG - Global Variable State Corruption in Multi-Page Table Extraction
+# ============================================================================
+#
+# PROBLEM STATEMENT:
+# ------------------
+# The module-level mutable global variables EDGES, CHARS, and TEXTPAGE below
+# are overwritten each time find_tables() is called on a new page. This causes
+# a critical bug where Table objects created from earlier pages return incorrect
+# data when extract() or to_markdown() is called after processing subsequent pages.
+#
+# ROOT CAUSE:
+# -----------
+# Table objects reference these globals directly rather than storing their own
+# copy of the character data at creation time. When find_tables() is called on
+# a new page, it clears and repopulates CHARS, EDGES, and TEXTPAGE with the new
+# page's data, corrupting the state needed by previously created Table objects.
+#
+# REPRODUCTION STEPS:
+# -------------------
+#   import fitz
+#   doc = fitz.open("multipage.pdf")
+#   tables = []
+#   for page in doc:
+#       tables.extend(page.find_tables().tables)
+#   # BUG: tables[0].extract() returns last page's content instead of page 0's content
+#
+# WORKAROUND:
+# -----------
+# Extract table content immediately after calling find_tables(), before processing
+# the next page:
+#   for page in doc:
+#       page_tables = page.find_tables()
+#       for table in page_tables.tables:
+#           content = table.extract()  # Extract NOW while CHARS is valid
+#           results.append((page.number, content))
+#
+# FIX APPROACH (for future reference):
+# ------------------------------------
+# Store per-Table copies of CHARS and TEXTPAGE in the Table instance:
+#   class Table:
+#       def __init__(self, page, cells, chars=None, textpage=None):
+#           self._chars = chars if chars else CHARS.copy()
+#           self._textpage = textpage
+#
+# Then modify Table.extract() and Table.to_markdown() to use self._chars and
+# self._textpage instead of the global variables.
+#
+# REFERENCES:
+# -----------
+# - GitHub Issue #3592: "trouble in page.find_tables" - User reports content from
+#   last page appearing in first page's table extraction. Notes "maybe the 'global'
+#   keyword make this trouble?"
+# - GitHub Issue #2892: "Some cells are missing in page.find_tables()"
+#
+# ============================================================================
+
 EDGES = []  # vector graphics from PyMuPDF
 CHARS = []  # text characters from PyMuPDF
 TEXTPAGE = None
@@ -1529,6 +1585,11 @@ class Table:
         return max([len(r.cells) for r in self.rows])
 
     def extract(self, **kwargs) -> list:
+        # TODO: BUG LOCATION - Global CHARS Reference
+        # This line accesses the global CHARS variable which may contain data from
+        # a different page if find_tables() was called on another page after this
+        # Table object was created. This causes incorrect extraction results.
+        # Recommended fix: Use instance copy self._chars instead of global CHARS
         chars = CHARS
         table_arr = []
 
@@ -1587,6 +1648,12 @@ class Table:
         for i, row in enumerate(cell_boxes):
             for j, cell in enumerate(row):
                 if cell is not None:
+                    # TODO: BUG LOCATION - Global TEXTPAGE Reference
+                    # This line accesses the global TEXTPAGE variable which may
+                    # reference a different page if find_tables() was called on
+                    # another page after this Table object was created.
+                    # Recommended fix: Use instance copy self._textpage instead
+                    # of global TEXTPAGE
                     cells[i][j] = extract_cells(
                         TEXTPAGE, cell_boxes[i][j], markdown=True
                     )
@@ -2586,6 +2653,14 @@ def find_tables(
     paths=None,  # accept vector graphics as parameter
 ):
     pymupdf._warn_layout_once()
+    # TODO: BUG LOCATION - Global State Reset
+    # The following lines clear and reset the global CHARS and EDGES variables.
+    # This causes state corruption for Table objects created from previously
+    # processed pages. Any Table.extract() or Table.to_markdown() calls on
+    # Tables from prior pages will incorrectly access this new page's CHARS
+    # and TEXTPAGE data instead of their original page's data.
+    # See the comprehensive bug documentation at the top of this file (near the
+    # global variable declarations) for full details and recommended fix approach.
     global CHARS, EDGES
     CHARS = []
     EDGES = []
